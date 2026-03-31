@@ -14,6 +14,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	quotav1 "k8s.io/apiserver/pkg/quota/v1"
 	"k8s.io/client-go/rest"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -198,10 +199,13 @@ func (v *VolcanoBatchScheduler) calculatePodGroupParams(rayClusterSpec *rayv1.Ra
 
 func createPodGroup(owner metav1.Object, podGroupName string, size int32, totalResource corev1.ResourceList) (volcanoschedulingv1beta1.PodGroup, error) {
 	var ownerRef metav1.OwnerReference
+	var rayClusterSpec *rayv1.RayClusterSpec
 	switch obj := owner.(type) {
 	case *rayv1.RayCluster:
+		rayClusterSpec = &obj.Spec
 		ownerRef = *metav1.NewControllerRef(obj, rayv1.SchemeGroupVersion.WithKind("RayCluster"))
 	case *rayv1.RayJob:
+		rayClusterSpec = obj.Spec.RayClusterSpec
 		ownerRef = *metav1.NewControllerRef(obj, rayv1.SchemeGroupVersion.WithKind("RayJob"))
 	}
 
@@ -240,6 +244,18 @@ func createPodGroup(owner metav1.Object, podGroupName string, size int32, totalR
 		}
 	}
 
+	// Handle subgroup policy config
+	subgroupPolicies := []volcanoschedulingv1beta1.SubGroupPolicySpec{}
+	if err := handleHeadPolicy(rayClusterSpec, podGroupName, &subgroupPolicies); err != nil {
+		return podGroup, err
+	}
+	if err := handleWorkerGroupPolicies(rayClusterSpec, podGroupName, &subgroupPolicies); err != nil {
+		return podGroup, err
+	}
+	if len(subgroupPolicies) > 0 {
+		podGroup.Spec.SubGroupPolicy = subgroupPolicies
+	}
+
 	if queue, ok := owner.GetLabels()[QueueNameLabelKey]; ok {
 		podGroup.Spec.Queue = queue
 	}
@@ -248,6 +264,85 @@ func createPodGroup(owner metav1.Object, podGroupName string, size int32, totalR
 	}
 
 	return podGroup, nil
+}
+
+func handleHeadPolicy(rayCluster *rayv1.RayClusterSpec, podGroupName string, subGroupPolicies *[]volcanoschedulingv1beta1.SubGroupPolicySpec) error {
+	if rayCluster == nil {
+		return nil
+	}
+	mode, ok := rayCluster.HeadGroupSpec.Template.GetLabels()[NetworkTopologyModeLabelKey]
+	if ok {
+		headGroupPolicy := volcanoschedulingv1beta1.SubGroupPolicySpec{
+			Name:         utils.RayNodeHeadGroupLabelValue,
+			SubGroupSize: ptr.To(int32(1)),
+			LabelSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					utils.RayNodeGroupLabelKey: utils.RayNodeHeadGroupLabelValue,
+				},
+			},
+			NetworkTopology: &volcanoschedulingv1beta1.NetworkTopologySpec{
+				Mode: volcanoschedulingv1beta1.NetworkTopologyMode(mode),
+			},
+			MatchLabelKeys: []string{utils.RayNodeGroupLabelKey},
+		}
+		tierValue, tierOk := rayCluster.HeadGroupSpec.Template.GetLabels()[NetworkTopologyHighestTierAllowedLabelKey]
+		if tierOk {
+			highestTierInt, err := strconv.Atoi(tierValue)
+			if err != nil {
+				return fmt.Errorf("failed to convert %s label to int: %w for podgroup %s", NetworkTopologyHighestTierAllowedLabelKey, err, podGroupName)
+			}
+			headGroupPolicy.NetworkTopology.HighestTierAllowed = &highestTierInt
+		}
+		*subGroupPolicies = append(*subGroupPolicies, headGroupPolicy)
+	}
+	return nil
+}
+
+func handleWorkerGroupPolicies(rayCluster *rayv1.RayClusterSpec, podGroupName string, subGroupPolicies *[]volcanoschedulingv1beta1.SubGroupPolicySpec) error {
+	if rayCluster == nil {
+		return nil
+	}
+	for _, workerGroup := range rayCluster.WorkerGroupSpecs {
+		mode, ok := workerGroup.Template.GetLabels()[NetworkTopologyModeLabelKey]
+		if ok {
+			subGroupSize := calculateSubGroupSize(rayCluster, workerGroup)
+			subGroupPolicy := volcanoschedulingv1beta1.SubGroupPolicySpec{
+				Name:         workerGroup.GroupName,
+				SubGroupSize: &subGroupSize,
+
+				LabelSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						utils.RayNodeGroupLabelKey: workerGroup.GroupName,
+					},
+				},
+
+				NetworkTopology: &volcanoschedulingv1beta1.NetworkTopologySpec{
+					Mode: volcanoschedulingv1beta1.NetworkTopologyMode(mode),
+				},
+				MatchLabelKeys: []string{utils.RayNodeGroupLabelKey},
+			}
+			tierValue, tierOk := workerGroup.Template.GetLabels()[NetworkTopologyHighestTierAllowedLabelKey]
+			if tierOk {
+				highestTierInt, err := strconv.Atoi(tierValue)
+				if err != nil {
+					return fmt.Errorf("failed to convert %s label to int: %w for podgroup %s", NetworkTopologyHighestTierAllowedLabelKey, err, podGroupName)
+				}
+				subGroupPolicy.NetworkTopology.HighestTierAllowed = &highestTierInt
+			}
+			*subGroupPolicies = append(*subGroupPolicies, subGroupPolicy)
+		}
+	}
+	return nil
+}
+
+func calculateSubGroupSize(rayCluster *rayv1.RayClusterSpec, workerGroup rayv1.WorkerGroupSpec) int32 {
+	if !utils.IsAutoscalingEnabled(rayCluster) {
+		return utils.GetWorkerGroupDesiredReplicas(workerGroup)
+	}
+	if workerGroup.Suspend != nil && *workerGroup.Suspend {
+		return 0
+	}
+	return *workerGroup.MinReplicas * workerGroup.NumOfHosts
 }
 
 func (v *VolcanoBatchScheduler) AddMetadataToChildResource(_ context.Context, parent metav1.Object, child metav1.Object, groupName string) {

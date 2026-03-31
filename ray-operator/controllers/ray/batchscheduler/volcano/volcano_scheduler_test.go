@@ -766,3 +766,57 @@ func TestCleanupOnCompletion(t *testing.T) {
 		a.False(didCleanup) // No cleanup should have happened (already deleted)
 	})
 }
+
+func TestCreatePodGroupWithSubGroupPolicy(t *testing.T) {
+	a := assert.New(t)
+
+	// Test with both network topology mode and hightest tier allowed
+	cluster := createTestRayClusterWithLabels(map[string]string{
+		NetworkTopologyModeLabelKey: "hard",
+		NetworkTopologyHighestTierAllowedLabelKey:"2",
+	})
+
+	cluster.Spec.HeadGroupSpec.Template.ObjectMeta.Labels = map[string]string{
+		NetworkTopologyModeLabelKey: "hard",
+		NetworkTopologyHighestTierAllowedLabelKey:"1",
+	}
+
+	cluster.Spec.WorkerGroupSpecs[0].GroupName = "worker1"
+	cluster.Spec.WorkerGroupSpecs[0].Template.ObjectMeta.Labels = map[string]string{
+		NetworkTopologyModeLabelKey: "hard",
+		NetworkTopologyHighestTierAllowedLabelKey:"1",
+	}
+
+	minMember := utils.CalculateDesiredReplicas(&cluster) + 1
+	totalResource := utils.CalculateDesiredResources(&cluster)
+	pg, err := createPodGroup(&cluster, getAppPodGroupName(&cluster), minMember, totalResource)
+	require.NoError(t, err)
+
+	a.Equal(cluster.Namespace, pg.Namespace)
+
+	// parent pod group policy
+	a.NotNil(pg.Spec.NetworkTopology)
+	a.Equal(volcanoschedulingv1beta1.NetworkTopologyMode("hard"), pg.Spec.NetworkTopology.Mode)
+	a.NotNil(pg.Spec.NetworkTopology.HighestTierAllowed)
+
+	// sub group policy
+	a.Len(pg.Spec.SubGroupPolicy, 2)
+
+	headGeoupPolicy := pg.Spec.SubGroupPolicy[0]
+	a.Equal(utils.RayNodeHeadGroupLabelValue, headGeoupPolicy.Name)
+	a.Equal(utils.RayNodeHeadGroupLabelValue, headGeoupPolicy.LabelSelector.MatchLabels[utils.RayNodeGroupLabelKey])
+	a.Equal(utils.RayNodeGroupLabelKey, headGeoupPolicy.MatchLabelKeys[0])
+	a.Equal(int32(1), *headGeoupPolicy.SubGroupSize)
+	a.Equal(volcanoschedulingv1beta1.NetworkTopologyMode("hard"), headGeoupPolicy.NetworkTopology.Mode)
+	a.NotNil(headGeoupPolicy.NetworkTopology.HighestTierAllowed)
+	a.Equal(1, *headGeoupPolicy.NetworkTopology.HighestTierAllowed)
+
+	workergroupPolicy := pg.Spec.SubGroupPolicy[1]
+	a.Equal("worker1", workergroupPolicy.Name)
+	a.Equal("worker1", workergroupPolicy.LabelSelector.MatchLabels[utils.RayNodeGroupLabelKey])
+	a.Equal(utils.RayNodeGroupLabelKey, workergroupPolicy.MatchLabelKeys[0])
+	a.Equal(int32(2), *workergroupPolicy.SubGroupSize)
+	a.Equal(volcanoschedulingv1beta1.NetworkTopologyMode("hard"), workergroupPolicy.NetworkTopology.Mode)
+	a.NotNil(workergroupPolicy.NetworkTopology.HighestTierAllowed)
+	a.Equal(1, *workergroupPolicy.NetworkTopology.HighestTierAllowed)
+}
