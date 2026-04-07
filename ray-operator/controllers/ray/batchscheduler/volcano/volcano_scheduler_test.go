@@ -798,6 +798,7 @@ func TestCreatePodGroupWithSubGroupPolicy(t *testing.T) {
 	a.NotNil(pg.Spec.NetworkTopology)
 	a.Equal(volcanoschedulingv1beta1.NetworkTopologyMode("hard"), pg.Spec.NetworkTopology.Mode)
 	a.NotNil(pg.Spec.NetworkTopology.HighestTierAllowed)
+	a.Equal(2, *pg.Spec.NetworkTopology.HighestTierAllowed)
 
 	// sub group policy
 	a.Len(pg.Spec.SubGroupPolicy, 2)
@@ -819,4 +820,23 @@ func TestCreatePodGroupWithSubGroupPolicy(t *testing.T) {
 	a.Equal(volcanoschedulingv1beta1.NetworkTopologyMode("hard"), workergroupPolicy.NetworkTopology.Mode)
 	a.NotNil(workergroupPolicy.NetworkTopology.HighestTierAllowed)
 	a.Equal(1, *workergroupPolicy.NetworkTopology.HighestTierAllowed)
+}
+
+func TestCreatePodGroup_SubGroupPolicyNetworkTopologyHighestTierAllowedNotInt(t *testing.T) {
+	a := assert.New(t)
+
+	// Test subgroup policy with network topology mode set and highest tier allowed is not an int
+	cluster := createTestRayCluster(1)
+	cluster.Spec.HeadGroupSpec.Template.ObjectMeta.Labels = map[string]string{
+		NetworkTopologyModeLabelKey: "hard",
+		NetworkTopologyHighestTierAllowedLabelKey:"not-an-int",
+	}
+
+	minMember := utils.CalculateDesiredReplicas(&cluster) + 1
+	totalResource := utils.CalculateDesiredResources(&cluster)
+	pg, err := createPodGroup(&cluster, getAppPodGroupName(&cluster), minMember, totalResource)
+
+	require.Error(t, err)
+	a.Contains(err.Error(), "failed to convert "+NetworkTopologyHighestTierAllowedLabelKey+" label to int")
+	a.Equal(cluster.Namespace, pg.Namespace)
 }
